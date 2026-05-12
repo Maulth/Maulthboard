@@ -5,6 +5,24 @@ from rxconfig import config
 from sqlmodel import select
 
 from .models import IdeaCard, ProjectStat
+from .watcher import start_watcher
+
+class WatcherState(rx.State):
+    """State to periodically fetch project stats."""
+    projects: list[ProjectStat] = []
+
+    def fetch_stats(self):
+        with rx.session() as session:
+            self.projects = session.exec(select(ProjectStat).order_by(ProjectStat.activity.desc())).all()
+
+    @rx.event(background=True)
+    async def poll_stats(self):
+        import asyncio
+        while True:
+            async with self:
+                self.fetch_stats()
+            yield
+            await asyncio.sleep(2) # Poll every 2 seconds
 
 class CanvasState(rx.State):
     """The state for the interactive canvas and idea cards."""
@@ -15,21 +33,10 @@ class CanvasState(rx.State):
     new_card_content: str = ""
     is_modal_open: bool = False
 
-    # Drag and Drop State
-    dragging_card_id: int = -1
-
     # Edit State
     editing_card_id: int = -1
     edit_card_title: str = ""
     edit_card_content: str = ""
-
-    def start_drag(self, card_id: int):
-        self.dragging_card_id = card_id
-
-    def drop_card(self, pos: list[int]):
-        if self.dragging_card_id != -1:
-            self.update_card_position(self.dragging_card_id, pos[0], pos[1])
-            self.dragging_card_id = -1
 
     def open_edit_modal(self, card_id: int):
         with rx.session() as session:
@@ -86,16 +93,6 @@ class CanvasState(rx.State):
         self.is_modal_open = False
         self.load_cards()
 
-    def update_card_position(self, card_id: int, new_x: int, new_y: int):
-        with rx.session() as session:
-            card = session.exec(select(IdeaCard).where(IdeaCard.id == card_id)).first()
-            if card:
-                card.x_pos = new_x
-                card.y_pos = new_y
-                session.add(card)
-                session.commit()
-        self.load_cards()
-
     def toggle_modal(self):
         self.is_modal_open = not self.is_modal_open
 
@@ -125,10 +122,25 @@ def idea_card(card: IdeaCard) -> rx.Component:
         backdrop_filter="blur(10px)",
         border="1px solid #00ffcc",
         box_shadow="0 0 10px rgba(0, 255, 204, 0.5)",
-        cursor="move",
-        draggable=True,
-        on_mouse_down=CanvasState.start_drag(card.id),
     )
+
+def project_card(stat: ProjectStat) -> rx.Component:
+    return rx.hstack(
+        rx.text(stat.name, color="#00ffcc", font_family="monospace", font_weight="bold"),
+        rx.spacer(),
+        rx.badge(
+            f"ACT: {stat.activity}",
+            color_scheme="cyan",
+            variant="outline",
+        ),
+        width="100%",
+        padding="10px",
+        background_color="rgba(10, 10, 10, 0.8)",
+        border="1px solid #333",
+        border_left="3px solid #00ffcc",
+        margin_bottom="10px",
+    )
+
 
 def index() -> rx.Component:
     # "Cyber-Command Center" dark theme base layout
@@ -198,28 +210,48 @@ def index() -> rx.Component:
             open=CanvasState.editing_card_id != -1,
         ),
 
-        # Infinite zoomable canvas container
-        rx.box(
-            rx.foreach(CanvasState.cards, idea_card),
-            width="5000px",
-            height="5000px",
-            position="relative",
-            background_color="#0a0a0a",
-            background_image="radial-gradient(circle, #333 1px, transparent 1px)",
-            background_size="50px 50px", # Grid dot pattern
-        ),
+        rx.hstack(
+            # Left panel: Project Activity
+            rx.box(
+                rx.heading("ALYRIA5_PROJECT_STATUS", size="4", color="#ff00ff", font_family="monospace", margin_bottom="15px"),
+                rx.foreach(WatcherState.projects, project_card),
+                width="25%",
+                height="80vh",
+                padding="15px",
+                border="1px solid #333",
+                background_color="rgba(15, 15, 15, 0.9)",
+                overflow_y="auto",
+            ),
 
-        # Wrapping the canvas in an overflow container to allow scrolling/zooming effect
-        overflow="auto",
-        height="80vh",
-        border="1px solid #333",
+            # Right panel: Canvas container
+            rx.box(
+                rx.box(
+                    rx.foreach(CanvasState.cards, idea_card),
+                    width="100%",
+                    min_height="100%",
+                    position="relative",
+                    background_color="#0a0a0a",
+                    background_image="radial-gradient(circle, #333 1px, transparent 1px)",
+                    background_size="50px 50px", # Grid dot pattern
+                ),
+                width="75%",
+                height="80vh",
+                overflow="auto",
+                border="1px solid #333",
+            ),
+            width="100%",
+            spacing="4",
+        ),
 
         background_color="#000000",
         min_height="100vh",
         width="100vw",
         padding="20px",
-        on_mount=CanvasState.load_cards,
+        on_mount=[CanvasState.load_cards, WatcherState.poll_stats],
     )
+
+# Start watcher outside of component render to avoid blocking SSR
+start_watcher()
 
 app = rx.App(
     theme=rx.theme(
